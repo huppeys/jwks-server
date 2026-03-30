@@ -1,98 +1,135 @@
-from fastapi import FastAPI, HTTPException, Query, Header
+"""
+main.py - FastAPI JWKS server (Project 2).
+
+Endpoints:
+    GET  /.well-known/jwks.json  Returns all valid (non-expired) public keys
+                                  in JWKS format.
+    POST /auth                   Issues a signed JWT using a key from the DB.
+                                  Add ?expired=true to sign with an expired key.
+
+Database:
+    totally_not_my_privateKeys.db (SQLite, created automatically on startup).
+    Keys are stored as PKCS1 PEM strings with Unix expiry timestamps.
+    All SQL uses parameterized queries (?) to prevent SQL injection.
+"""
+
+import time
+from typing import Any
+
+import jwt as pyjwt
+from cryptography.hazmat.primitives import serialization
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
-from jose import jwt, JWTError
-from key_manager import KeyManager
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Any
 
-app = FastAPI()
-key_manager = KeyManager()
+import db
+import key_manager
 
-# Generate demo keys
-key_manager.generate_key("example_key_1")  # Valid key
-key_manager.generate_key("example_key_2", expires_in_minutes=0)  # Expired key
+app = FastAPI(title="JWKS Server", version="2.0.0")
 
-# ==============================
-# JWKS Endpoint
-# ==============================
-@app.get("/.well-known/jwks.json")
-def get_jwks():
-    keys = key_manager.get_public_keys()
+
+# ---------------------------------------------------------------------------
+# Startup
+# ---------------------------------------------------------------------------
+
+@app.on_event("startup")
+def startup() -> None:
+    """
+    Initialize the server on startup.
+
+    Performs two tasks:
+        1. Creates the SQLite database file and ``keys`` table if they do
+           not already exist.
+        2. Seeds one already-expired key and one key valid for one hour so
+           that both ``POST /auth`` code paths can always be exercised.
+    """
+    db.initialize_db()
+    key_manager.generate_and_store_key(expires_in_seconds=-1)
+    key_manager.generate_and_store_key(expires_in_seconds=3600)
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get(
+    "/.well-known/jwks.json",
+    summary="Return all valid public keys as JWKS",
+    response_class=JSONResponse,
+)
+def get_jwks() -> JSONResponse:
+    """
+    Retrieve all non-expired public keys from the database and return them
+    in standard JWKS (JSON Web Key Set) format.
+
+    Expired keys are excluded.  The ``n`` and ``e`` values are
+    base64url-encoded per RFC 7517.
+
+    Returns:
+        JSONResponse: A JSON object with a single ``keys`` array containing
+            one JWK dict per valid key.
+    """
+    rows = db.get_all_valid_keys()
+    keys: list[dict[str, Any]] = []
+    for row in rows:
+        private_key = key_manager.deserialize_private_key(row["key"])
+        jwk = key_manager.public_key_to_jwk(row["kid"], private_key)
+        keys.append(jwk)
     return JSONResponse(content={"keys": keys})
 
-# ==============================
-# Authentication Endpoint
-# ==============================
-@app.post("/auth")
-def authenticate(expired: bool = Query(False)):
-    for kid, key_info in key_manager.keys.items():
-        private_key = key_info["private_key"]
-        if expired:
-            token = jwt.encode(
-                {
-                    "sub": "user",
-                    "exp": datetime.now(timezone.utc) - timedelta(minutes=5),
-                },
-                private_key,
-                algorithm="RS256",
-                headers={"kid": kid},
-            )
-            return {"token": token}
 
-        # Valid token
-        token = jwt.encode(
-            {
-                "sub": "user",
-                "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
-            },
-            private_key,
-            algorithm="RS256",
-            headers={"kid": kid},
-        )
-        return {"token": token}
+@app.post(
+    "/auth",
+    summary="Issue a signed JWT (mock authentication)",
+    response_class=JSONResponse,
+)
+async def authenticate(expired: bool = Query(False)) -> JSONResponse:
+    """
+    Issue a JWT signed with an RSA private key retrieved from the database.
 
-    raise HTTPException(status_code=404, detail="No available keys")
+    By default a valid (non-expired) key is used.  When the ``expired``
+    query parameter is ``true``, an already-expired key is used instead,
+    producing a JWT that will fail signature verification by design.
 
-# ==============================
-# Protected Endpoint
-# ==============================
-@app.get("/protected")
-def protected_route(authorization: str = Header(None)):
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Missing Authorization header")
+    Accepts HTTP Basic Auth or a JSON body with ``username`` / ``password``
+    fields.  Credentials are not validated — this is a mock authentication
+    endpoint for testing purposes only.
 
-    try:
-        scheme, token = authorization.split()
-        if scheme.lower() != "bearer":
-            raise HTTPException(status_code=401, detail="Invalid authentication scheme")
+    Args:
+        expired: When ``True``, sign the JWT with an expired key.
 
-        # Extract kid from token header
-        unverified_header = jwt.get_unverified_header(token)
-        kid = unverified_header.get("kid")
-        if kid not in key_manager.keys:
-            raise JWTError("Invalid key ID")
+    Returns:
+        JSONResponse: A JSON object containing a single ``token`` field
+            with the signed JWT string.
 
-        public_key = key_manager.keys[kid]["public_key"]
-        decoded = jwt.decode(token, public_key, algorithms=["RS256"])
-        return {"message": "Access granted", "user": decoded["sub"]}
+    Raises:
+        HTTPException 404: If no key of the requested type exists in the DB.
+    """
+    if expired:
+        row = db.get_expired_key()
+        if row is None:
+            raise HTTPException(status_code=404, detail="No expired key found in DB")
+    else:
+        row = db.get_valid_key()
+        if row is None:
+            raise HTTPException(status_code=404, detail="No valid key found in DB")
 
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    private_key = key_manager.deserialize_private_key(row["key"])
+    pem_bytes: bytes = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.TraditionalOpenSSL,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
 
-# ==============================
-# Helper function for testing
-# ==============================
-def decode_jwt(token: str) -> Dict[str, Any]:
-    """Decode JWT and return payload."""
-    try:
-        unverified_header = jwt.get_unverified_header(token)
-        kid = unverified_header.get("kid")
-        if kid not in key_manager.keys:
-            raise JWTError("Invalid key ID")
-
-        public_key = key_manager.keys[kid]["public_key"]
-        decoded = jwt.decode(token, public_key, algorithms=["RS256"])
-        return decoded
-    except JWTError as e:
-        raise e
-
+    now: int = int(time.time())
+    payload: dict[str, Any] = {
+        "sub": "userABC",
+        "iat": now,
+        "exp": row["exp"],
+    }
+    token: str = pyjwt.encode(
+        payload,
+        pem_bytes,
+        algorithm="RS256",
+        headers={"kid": str(row["kid"])},
+    )
+    return JSONResponse(content={"token": token})
